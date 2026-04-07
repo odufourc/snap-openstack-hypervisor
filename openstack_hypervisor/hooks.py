@@ -73,6 +73,15 @@ TRUE_STRINGS = ("1", "t", "true", "on", "y", "yes")
 
 OVN_CHASSIS_PLUG = "ovn-chassis"
 
+# OVS management mode values for the network.ovs-managed-by snap config
+OVS_MANAGED_BY_AUTO = "auto"  # default: detect via ovn-chassis plug connection
+OVS_MANAGED_BY_MICROOVN = "microovn"  # external OVS managed by microovn snap
+OVS_MANAGED_BY_HYPERVISOR = "hypervisor"  # internal OVS managed by hypervisor snap
+
+# Module-level cache of the OVS management mode, set once per configure hook run.
+# Avoids threading snap through every function that checks OVS mode.
+_OVS_MANAGED_BY: str = OVS_MANAGED_BY_AUTO
+
 # NOTE(dmitriis): there is currently no way to make sure this directory gets
 # recreated on reboot which would normally be done via systemd-tmpfiles.
 # mkdir -p /run/lock/snap.$SNAP_INSTANCE_NAME
@@ -389,6 +398,10 @@ DEFAULT_CONFIG = {
     "masakari.enable": False,
     # Option to signal external switch restart is required
     "network.external-switch-restart": False,
+    # OVS management mode: 'auto' (detect via ovn-chassis plug), 'microovn' (external),
+    # or 'hypervisor' (internal). Set by charm when microovn may be installed after
+    # hypervisor to avoid the snap assuming internal OVS too early.
+    "network.ovs-managed-by": OVS_MANAGED_BY_AUTO,
 }
 
 
@@ -1808,7 +1821,7 @@ def _configure_tls(snap: Snap, ovs_cli: OVSCli, configure_ovn_tls: bool = True) 
     if configure_ovn_tls:
         _configure_ovn_tls(snap, ovs_cli, is_ovs_external())
     else:
-        logging.info("Internal OVS not ready, deferring OVN TLS configuration.")
+        logging.info("OVS not ready, deferring OVN TLS configuration.")
     _configure_libvirt_tls(snap)
     _configure_cabundle_tls(snap)
 
@@ -2815,13 +2828,51 @@ def is_connected(name: str) -> bool:
         return False
 
 
+def _set_ovs_managed_by(snap: Snap) -> None:
+    """Read network.ovs-managed-by from snap config and cache it for this hook run.
+
+    Must be called once at the start of the configure hook, after defaults have
+    been applied, and before any code that calls is_ovs_external().
+
+    Valid values for network.ovs-managed-by:
+      - 'auto'       (default) detect by whether ovn-chassis plug is connected
+      - 'microovn'   force external OVS; microovn manages OVS (may be installed later)
+      - 'hypervisor' force internal OVS; hypervisor snap manages OVS
+    """
+    global _OVS_MANAGED_BY
+
+    value = snap.config.get("network.ovs-managed-by") or OVS_MANAGED_BY_AUTO
+    if value not in (OVS_MANAGED_BY_AUTO, OVS_MANAGED_BY_MICROOVN, OVS_MANAGED_BY_HYPERVISOR):
+        logging.warning(
+            "Unrecognised network.ovs-managed-by value %r, falling back to 'auto'", value
+        )
+        value = OVS_MANAGED_BY_AUTO
+
+    _OVS_MANAGED_BY = value
+    is_ovs_external.cache_clear()
+    logging.info("OVS managed-by mode: %s", _OVS_MANAGED_BY)
+
+
 @functools.lru_cache(maxsize=1)
 def is_ovs_external() -> bool:
-    """Check if OVN chassis plug is connected.
+    """Return True if OVS is managed externally (by microovn), False otherwise.
 
-    Result is cached during configure hook execution to avoid repeated
-    subprocess calls.
+    Checks network.ovs-managed-by snap config (cached in _OVS_MANAGED_BY) first:
+      - 'microovn'   -> True  (external OVS; microovn may not yet be installed)
+      - 'hypervisor' -> False (internal OVS; ignore plug state)
+      - 'auto'       -> check whether the ovn-chassis content plug is connected
+
+    Result is cached for the duration of a single configure hook execution to
+    avoid repeated subprocess calls.  Call _set_ovs_managed_by() at the start
+    of each configure hook run to refresh the cache.
     """
+    if _OVS_MANAGED_BY == OVS_MANAGED_BY_MICROOVN:
+        logging.debug("OVS managed-by=microovn, treating as external OVS.")
+        return True
+    if _OVS_MANAGED_BY == OVS_MANAGED_BY_HYPERVISOR:
+        logging.debug("OVS managed-by=hypervisor, treating as internal OVS.")
+        return False
+    # OVS_MANAGED_BY_AUTO: fall back to plug connection check
     return is_connected(OVN_CHASSIS_PLUG)
 
 
@@ -2882,6 +2933,17 @@ def _internal_ovs_ready(snap: Snap) -> bool:
     return ovs_socket_path.exists() and bool(ctl_socket and Path(ctl_socket).exists())
 
 
+def _external_ovs_ready(snap: Snap) -> bool:
+    """Return whether the external OVS (microovn) socket is present.
+
+    When network.ovs-managed-by=microovn is set but microovn has not yet been
+    installed, the socket file will be absent and all ovs-vsctl commands would
+    hang.  This check allows the configure hook to defer OVS/OVN networking
+    configuration until microovn is actually available.
+    """
+    return _ovs_socket_path(snap).exists()
+
+
 def configure(snap: Snap) -> None:
     """Runs the `configure` hook for the snap.
 
@@ -2899,6 +2961,10 @@ def configure(snap: Snap) -> None:
     _mkdirs(snap)
     _update_default_config(snap)
     _setup_secrets(snap)
+    # Cache OVS management mode from snap config before any is_ovs_external() calls.
+    # This allows the charm to set network.ovs-managed-by=microovn so that the snap
+    # behaves correctly even when microovn is installed after openstack-hypervisor.
+    _set_ovs_managed_by(snap)
     _detect_compute_flavors(snap)
 
     ovs_socket = ovs_switch_socket(snap)
@@ -2910,19 +2976,29 @@ def configure(snap: Snap) -> None:
     exclude_services = _get_exclude_services(context)
     services = snap.services.list()
     ovs_external = is_ovs_external()
+    logging.info(
+        "OVS management: %s", "external (microovn)" if ovs_external else "internal (hypervisor)"
+    )
     internal_ovs_deferred = not ovs_external and not _internal_ovs_ready(snap)
+    external_ovs_deferred = ovs_external and not _external_ovs_ready(snap)
+    ovs_deferred = internal_ovs_deferred or external_ovs_deferred
     for service in exclude_services:
         services[service].stop(disable=True)
 
     with RestartOnChange(snap, {**TEMPLATES, **TLS_TEMPLATES}, exclude_services):
         _render_templates(snap, context)
-        _configure_tls(snap, ovs_cli, configure_ovn_tls=not internal_ovs_deferred)
+        _configure_tls(snap, ovs_cli, configure_ovn_tls=not ovs_deferred)
         _configure_webdav_apache(snap, context)
 
     if internal_ovs_deferred:
         logging.info(
             "Internal OVS is not ready yet, deferring OVS/OVN configuration until the next "
             "configure hook."
+        )
+    elif external_ovs_deferred:
+        logging.info(
+            "External OVS (microovn) socket not present yet, deferring OVS/OVN configuration "
+            "until the next configure hook. Install microovn or connect the ovn-chassis plug."
         )
     else:
         try:
@@ -2941,7 +3017,36 @@ def configure(snap: Snap) -> None:
         snap, bool(context.get("network", {}).get("sriov_nic_physical_device_mappings"))
     )
     if not ovs_external:
-        _ensure_internal_ovs_services(snap, exclude_services)
+        # When OVS mode is 'auto', the snap doesn't yet know whether microovn will be
+        # used.  The reliable signal that the charm has finished its initial configuration
+        # is that identity credentials have been set: identity.auth-url is a real Keystone
+        # endpoint (not the placeholder default) AND identity.username has been provided.
+        # Until then, skip starting ovs-vswitchd: creating system@ovs-system here would
+        # block a concurrently-installing microovn snap.
+        #
+        # Checking both fields guards against the edge case where an operator legitimately
+        # runs Keystone at http://localhost:5000/v3 — in that scenario the charm will
+        # always have set identity.username so the guard still clears correctly.
+        #
+        # When OVS mode is explicitly 'hypervisor' (operator/charm intent is clear),
+        # bypass this check and start internal OVS immediately.
+        identity_opts = snap.config.get_options("identity")
+        identity_url = identity_opts.get("identity.auth-url")
+        identity_username = identity_opts.get("identity.username")
+        charm_not_configured = (
+            _OVS_MANAGED_BY == OVS_MANAGED_BY_AUTO
+            and identity_url == DEFAULT_CONFIG["identity.auth-url"]
+            and identity_username is None
+        )
+        if charm_not_configured:
+            logging.info(
+                "identity.auth-url is still the default placeholder and "
+                "identity.username is unset: the charm has not yet applied "
+                "configuration. Deferring internal OVS service startup to avoid "
+                "creating system@ovs-system before microovn can install."
+            )
+        else:
+            _ensure_internal_ovs_services(snap, exclude_services)
 
 
 def _get_configure_context(snap: Snap) -> dict:
