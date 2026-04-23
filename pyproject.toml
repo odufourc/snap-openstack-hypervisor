@@ -53,6 +53,8 @@ dev= [
 tics= [
     "python-novaclient",
     "libvirt-python",
+    "pylint",
+    "flake8",
 ]
 
 [project.urls]
